@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import csv
 import io
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
+from app.schemas import ActionPayload, ActionResult, PageResult
 from app.services.data_publish import DataPublishService
+from app.store import store
 
 router = APIRouter(prefix="/api/data_publish", tags=["数据发布"])
 
@@ -16,6 +18,7 @@ service = DataPublishService()
 
 LIST_FIELDS = ["版本编号", "数据集名称", "发布范围", "查询参数", "响应字段", "缓存秒数", "分页上限", "消费应用"]
 STATUSES = ["草稿", "待校验", "已发布", "已撤回"]
+RESERVED_QUERY = {"keyword", "status", "page", "size", "sort_by", "sort_order"}
 
 
 def query_filters(request: Request) -> dict[str, str]:
@@ -24,6 +27,15 @@ def query_filters(request: Request) -> dict[str, str]:
         key: value.strip()
         for key, value in request.query_params.items()
         if key in LIST_FIELDS and value.strip()
+    }
+
+
+def table_query_filters(request: Request) -> dict[str, str]:
+    """已发布结果的字段过滤：除保留参数外的任意列名均可作为过滤条件。"""
+    return {
+        key: value.strip()
+        for key, value in request.query_params.items()
+        if key not in RESERVED_QUERY and value.strip()
     }
 
 
@@ -39,6 +51,23 @@ def list_entries(
     items, total = service.list_entries(
         filters=query_filters(request), keyword=keyword, status=status, page=page, size=size)
     return PageResult(items=items, total=total, page=page, size=size)
+
+
+@router.get("/notifications")
+def list_notifications(only_open: bool = Query(default=True)) -> dict[str, Any]:
+    """数据发布页面的跨模块通知（发布阻断等），窗口修复后随DWS通知一起核销。"""
+    notes = store.get_notifications(module="data_publish", only_open=only_open)
+    return {"items": notes, "total": len(notes)}
+
+
+@router.get("/{entry_id}/blockers")
+def get_blockers(entry_id: int) -> dict[str, Any]:
+    """发布前复核：该版本目标数据集当前的待修复窗口清单。"""
+    entry = service.get_entry(entry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"发布版本 {entry_id} 不存在或已归档")
+    blockers = service.pending_windows(entry.get("数据集名称", ""))
+    return {"items": blockers, "total": len(blockers), "blocked": len(blockers) > 0}
 
 
 @router.get("/export")
@@ -93,9 +122,20 @@ def run_action(entry_id: int, payload: ActionPayload) -> ActionResult:
 
 
 @router.get("/{entry_id}/data")
-def get_published_data(entry_id: int) -> dict[str, Any]:
-    """返回发布版本关联的转换节点输出数据。"""
-    data = service.get_published_data(entry_id)
-    if data is None:
-        raise HTTPException(status_code=404, detail=f"发布版本 {entry_id} 无关联数据")
-    return data
+def get_published_data(
+    entry_id: int,
+    request: Request,
+    keyword: str | None = Query(default=None, description="全列模糊检索"),
+    sort_by: str | None = Query(default=None, description="排序字段"),
+    sort_order: str = Query(default="asc", pattern="^(asc|desc)$"),
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=20, ge=1, le=200),
+) -> dict[str, Any]:
+    """返回发布版本关联的已发布数据（版本化快照），支持筛选、排序与翻页复核。"""
+    items, total, columns, meta = service.query_published_rows(
+        entry_id, filters=table_query_filters(request), keyword=keyword,
+        sort_by=sort_by, sort_order=sort_order, page=page, size=size)
+    if not meta and service.get_entry(entry_id) is None:
+        raise HTTPException(status_code=404, detail=f"发布版本 {entry_id} 不存在或已归档")
+    return {"items": items, "total": total, "page": page, "size": size,
+            "columns": columns, **meta}

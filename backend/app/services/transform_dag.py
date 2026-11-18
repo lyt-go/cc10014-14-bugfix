@@ -99,7 +99,7 @@ class TransformDagService:
         if not input_data:
             return {"ok": False, "message": f"输入表 {input_table} 无数据"}
         # 简单模拟SQL解析：GROUP BY 聚合
-        output_data = self._execute_script(input_data, script)
+        output_data = self._execute_script(input_data, script, output_table)
         store.set_table_rows(output_table, output_data)
         # 自动生成血缘
         store.add_lineage(input_table, output_table,
@@ -112,9 +112,11 @@ class TransformDagService:
         sch.derive_schema_from_lineage(output_table)
         return {"ok": True, "message": f"节点执行完成，输出{len(output_data)}行到 {output_table}", "rows": output_data}
 
-    def _execute_script(self, data: list[dict[str, Any]], script: str) -> list[dict[str, Any]]:
+    def _execute_script(self, data: list[dict[str, Any]], script: str,
+                        output_table: str = "") -> list[dict[str, Any]]:
         if "GROUP BY" in script.upper():
             import re
+            from app.services.aggregation import safe_aggregate
             # 找聚合字段：SUM/COUNT/AVG/MAX/MIN(...)
             agg_m = re.search(r"(SUM|COUNT|AVG|MAX|MIN)\s*\(([^)]+)\)", script, re.I)
             measure = agg_m.group(2).strip() if agg_m else ""
@@ -131,33 +133,10 @@ class TransformDagService:
                     break
             dims_raw = [d.strip() for d in after_gb.split(",")]
             dims = [d for d in dims_raw if d and not re.search(r'^(SUM|COUNT|AVG|MAX|MIN)\s*\(', d, re.I)]
-            groups: dict[str, dict[str, Any]] = {}
-            for row in data:
-                key = "|".join(str(row.get(d, "")) for d in dims) if dims else "*"
-                if key not in groups:
-                    groups[key] = {d: row.get(d) for d in dims} if dims else {}
-                    groups[key]["_values"] = []
-                try:
-                    groups[key]["_values"].append(float(row.get(measure, 0) or 0))
-                except Exception:
-                    groups[key]["_values"].append(0.0)
-            result = []
-            for g in groups.values():
-                out = {d: g[d] for d in dims} if dims else {}
-                vals = g["_values"]
-                if agg == "SUM":
-                    out[f"{measure}_agg"] = sum(vals)
-                elif agg == "COUNT":
-                    out[f"{measure}_agg"] = len(vals)
-                elif agg == "AVG":
-                    out[f"{measure}_agg"] = sum(vals) / len(vals) if vals else 0
-                elif agg == "MAX":
-                    out[f"{measure}_agg"] = max(vals) if vals else 0
-                elif agg == "MIN":
-                    out[f"{measure}_agg"] = min(vals) if vals else 0
-                else:
-                    out[f"{measure}_agg"] = sum(vals)
-                result.append(out)
+            # 安全聚合：空维度与非法度量隔离，不再静默回退为0混入结果
+            result, abnormal_rows = safe_aggregate(data, dims, measure, agg)
+            # 异常分组独立落库（隔离表）；本轮无异常时同样覆写，避免上一轮残留
+            store.set_table_rows(f"{output_table}__abnormal", abnormal_rows)
             return result
         # 默认透传
         return [dict(r) for r in data]

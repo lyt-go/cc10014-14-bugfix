@@ -29,6 +29,29 @@ class Store:
         self._archive_records: list[dict[str, Any]] = []
         # 补数区间记录
         self._backfill_partitions: dict[str, list[dict[str, Any]]] = {}
+        # DWS聚合运行态: "dws表名" -> 最近一次运行元数据
+        self._dws_runs: dict[str, dict[str, Any]] = {}
+        # DWS待修复窗口清单: "dws表名" -> [窗口记录, ...]（含历史，按状态区分）
+        self._dws_windows: dict[str, list[dict[str, Any]]] = {}
+        # DWS异常分组隔离表数据: "dws表名__abnormal" -> [异常行, ...]
+        # 已发布快照: "数据集名称" -> {version, rows, published_at, source_version}
+        self._published_snapshots: dict[str, dict[str, Any]] = {}
+        # 跨模块通知（异常窗口、发布阻断等），修复后自动核销避免残留
+        self._notifications: list[dict[str, Any]] = []
+
+    def reset_runtime(self) -> None:
+        """清空所有运行期状态，供测试回到干净起点（模块登记数据由调用方自行重置）。"""
+        self._table_data.clear()
+        self._versions.clear()
+        self._lineage_edges.clear()
+        self._quality_results.clear()
+        self._snapshot_data.clear()
+        self._archive_records.clear()
+        self._backfill_partitions.clear()
+        self._dws_runs.clear()
+        self._dws_windows.clear()
+        self._published_snapshots.clear()
+        self._notifications.clear()
 
     def module_names(self) -> list[str]:
         return sorted(self._tables)
@@ -165,6 +188,75 @@ class Store:
 
     def get_backfill_partitions(self, job_id: str) -> list[dict[str, Any]]:
         return list(self._backfill_partitions.get(job_id, []))
+
+    # ---- DWS聚合运行态与待修复窗口 ----
+
+    def get_dws_run(self, table_name: str) -> dict[str, Any] | None:
+        run = self._dws_runs.get(table_name)
+        return dict(run) if run else None
+
+    def save_dws_run(self, table_name: str, run: dict[str, Any]) -> None:
+        self._dws_runs[table_name] = dict(run)
+
+    def get_dws_windows(self, table_name: str) -> list[dict[str, Any]]:
+        return [dict(w) for w in self._dws_windows.get(table_name, [])]
+
+    def save_dws_windows(self, table_name: str, windows: list[dict[str, Any]]) -> None:
+        self._dws_windows[table_name] = [dict(w) for w in windows]
+
+    def dws_abnormal_table(self, table_name: str) -> str:
+        return f"{table_name}__abnormal"
+
+    def get_dws_abnormal_rows(self, table_name: str) -> list[dict[str, Any]]:
+        return [dict(r) for r in self.table_rows(self.dws_abnormal_table(table_name))]
+
+    # ---- 发布快照（同一数据集用户始终只看到一份完整结果） ----
+
+    def save_published_snapshot(self, dataset: str, snapshot: dict[str, Any]) -> None:
+        self._published_snapshots[dataset] = dict(snapshot)
+
+    def get_published_snapshot(self, dataset: str) -> dict[str, Any] | None:
+        snapshot = self._published_snapshots.get(dataset)
+        return dict(snapshot) if snapshot else None
+
+    # ---- 跨模块通知 ----
+
+    def add_notification(self, notification: dict[str, Any]) -> dict[str, Any]:
+        note = {"id": len(self._notifications) + 1, "status": "待处理", **notification}
+        self._notifications.append(note)
+        return note
+
+    def get_notifications(self, module: str | None = None,
+                          scope: str | None = None, only_open: bool = False) -> list[dict[str, Any]]:
+        notes = self._notifications
+        if module:
+            notes = [n for n in notes if n.get("module") == module]
+        if scope:
+            notes = [n for n in notes if n.get("scope") == scope]
+        if only_open:
+            notes = [n for n in notes if n.get("status") == "待处理"]
+        return [dict(n) for n in notes]
+
+    def resolve_notifications(self, scope: str, ref: str) -> int:
+        """核销某条数据（按 scope+ref 定位）的全部待处理通知，返回核销条数。"""
+        count = 0
+        for note in self._notifications:
+            if note.get("scope") == scope and note.get("ref") == ref and note.get("status") == "待处理":
+                note["status"] = "已核销"
+                note["resolved_at"] = datetime.now().isoformat()
+                count += 1
+        return count
+
+    def resolve_dataset_notifications(self, scope: str, dataset: str) -> int:
+        """核销某数据集下指定scope的全部待处理通知（窗口修复后清理发布阻断残留）。"""
+        count = 0
+        for note in self._notifications:
+            if (note.get("scope") == scope and note.get("dataset") == dataset
+                    and note.get("status") == "待处理"):
+                note["status"] = "已核销"
+                note["resolved_at"] = datetime.now().isoformat()
+                count += 1
+        return count
 
 
 store = Store()
